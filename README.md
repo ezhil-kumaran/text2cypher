@@ -1,7 +1,8 @@
+# Text2Cypher: Fine-Tuning Llama-3.2-1B with QLoRA & AST Validation
 
-# Text2Cypher: Fine-Tuning Llama-3.2-1B with QLoRA
+An end-to-end implementation for fine-tuning an open-weights Small Language Model (SLM) to convert natural language queries into executable Neo4j Cypher queries.
 
-An end-to-end implementation for fine-tuning an open-weights Small Language Model (SLM) to convert natural language queries into executable Neo4j Cypher queries using graph schema definitions.
+Crucially, this project moves beyond standard lexical evaluation (like BLEU or ROUGE) and implements **Abstract Syntax Tree (AST) Parsing** to strictly validate the structural correctness of the generated graph queries.
 
 ---
 
@@ -16,27 +17,34 @@ RETURN p.name
 
 ```
 
-Off-the-shelf generalist models often struggle to consistently ground queries in exact schema definitions, hallucinate non-existent edge types, or add conversational filler. This project explores fine-tuning **Llama-3.2-1B-Instruct** using parameter-efficient fine-tuning (PEFT/QLoRA) to create a specialized, lightweight Cypher generation engine.
+Off-the-shelf generalist models often struggle to consistently ground queries in exact schema definitions or output pure, executable code. This project explores fine-tuning **Llama-3.2-1B-Instruct** using parameter-efficient fine-tuning (PEFT/QLoRA) to create a specialized, lightweight Cypher generation engine.
 
 ---
 
-## 🚀 Why This Is Useful
+## 📊 Evaluation: The "Token F1 Trap" & AST Validation
 
-* **Graph-RAG Pipelines:** Serves as the query-translation engine inside Graph-Augmented Retrieval pipelines, enabling semantic search systems to dynamically pull structured facts directly from Neo4j.
-* **Non-Technical Access:** Enables non-technical domain experts (analysts, healthcare staff, compliance teams) to interrogate complex connected data using plain English without writing graph queries.
-* **Edge & Cost-Efficient Deployment:** By targeting a 1B-parameter model with 4-bit quantization, the resulting adapter can be served on low-cost compute instances, edge devices, or localized setups without incurring proprietary API costs.
+Standard LLM evaluation metrics (Token Precision/Recall, F1-Score, Sequence Similarity) are fundamentally flawed for code generation. A generated query can achieve a high F1 score by memorizing database labels, but completely fail to execute due to a single misplaced bracket or invalid relationship arrow.
+
+To accurately measure model performance, this project employs a custom evaluation metric using **PyCypher**. Instead of just counting matching tokens, the metric attempts to parse the generated text into a Cypher Abstract Syntax Tree (AST).
+
+**The Custom Metric Pipeline:**
+
+1. **Lexical Overlap (F1 & Gestalt Pattern Matching):** Measures how closely the generated vocabulary matches the ground truth.
+2. **Offline Syntax Validation (`pycypher`):** Definitively tests if the model generated mathematically valid Cypher grammar. If the AST parser catches an error, the query is marked invalid regardless of its F1 score.
+
+This strict validation prevents the deployment of models that generate structurally broken queries masked by high token-overlap scores.
 
 ---
 
 ## 🛠️ Stack & Technologies Used
 
 * **Base Model:** `meta-llama/Llama-3.2-1B-Instruct`
-* **Dataset:** `neo4j/text2cypher-2024v1` (official Neo4j Text2Cypher benchmark dataset containing schema metadata, natural language questions, and canonical Cypher queries)
+* **Dataset:** `neo4j/text2cypher-2024v1`
+* **Evaluation:** `pycypher` (Offline AST parsing and syntax validation)
 * **Fine-Tuning Framework:**
 * **Hugging Face `transformers` & `trl`:** Orchestrated with `SFTTrainer` and `SFTConfig`.
 * **`peft` (QLoRA):** Low-Rank Adaptation (LoRA) targeted across projection layers (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`).
-* **`bitsandbytes`:** 4-bit NormalFloat (NF4) quantization with double quantization to fit within limited GPU memory.
-* **`accelerate`:** Handles hardware mapping and gradient execution.
+* **`bitsandbytes`:** 4-bit NormalFloat (NF4) quantization with double quantization.
 
 
 * **Environment:** Kaggle / Google Colab (NVIDIA Tesla T4 GPU).
@@ -49,32 +57,22 @@ This iteration was deliberately engineered to train within strict memory and ses
 
 | Parameter | Value | Constraint Rationale |
 | --- | --- | --- |
-| **Quantization** | 4-bit (NF4) | Reduces model memory footprint to under 2GB |
-| **Training Subset** | 3,000 samples | Downsampled from ~40,000 to fit session execution limits |
-| **Evaluation Subset** | 300 samples | Reduced evaluation overhead |
-| **Epochs** | 1 | Kept to minimum to complete execution in one run |
-| **Batch Configuration** | Batch size 2, Accumulation 4 | Balances gradient smoothing without OOM crashes |
-| **Sequence Packing** | `packing=True` | Packed sequences to minimize token padding |
+| **Quantization** | 4-bit (NF4) | Reduces model memory footprint to under 2GB. |
+| **Training Subset** | 3,000 samples | Downsampled from ~40,000 to fit session execution limits. |
+| **Evaluation Subset** | 300 samples | Reduced evaluation overhead. |
+| **Epochs** | 1 | Kept to the minimum to complete execution in one run. |
+| **Sequence Packing** | `packing=True` | Packed sequences to minimize token padding. |
 
 ---
 
 ## ⚠️ Known Gotchas, Hallucinations & Failure Modes
 
-During testing, the fine-tuned adapter exhibited structural degradation and unexpected hallucinated filters:
+During testing under the resource constraints listed above, the fine-tuned adapter exhibited structural degradation caught by our AST parser.
 
 ### 1. Sample Query Comparison
 
 * **Prompt:** *"Which Toyota vehicles have overheating problems?"*
-* **Ground Truth Query:**
-```cypher
-MATCH (v:Vehicle)-[:HAS_PROBLEM]->(p:Problem {name: 'Overheating'})
-WHERE v.make = 'Toyota'
-RETURN v
-
-```
-
-
-* **Base Model Output:**
+* **Base Model Output (AST Valid):**
 ```cypher
 MATCH (v:Vehicle { make: 'Toyota' })-[:HAS_PROBLEM]->(p:Problem)
 WHERE p.name = 'Overheating'
@@ -83,7 +81,7 @@ RETURN v.name AS VehicleName, p.name AS ProblemName
 ```
 
 
-* **Fine-Tuned Model Output (Constrained Run):**
+* **Fine-Tuned Model Output (AST Invalid):**
 ```cypher
 MATCH (v:Vehicle) WHERE v.make = 'Toyota' AND v.year < 2000 AND v.year > 1995 AND HAS_PROBLEM {problem: 'overheating'} RETURN v.name
 
@@ -93,18 +91,15 @@ MATCH (v:Vehicle) WHERE v.make = 'Toyota' AND v.year < 2000 AND v.year > 1995 AN
 
 ### 2. Root Cause Analysis of the Faults
 
-1. **Syntax Degradation (Relationship Pattern Breakdown):**
+1. **Syntax Degradation Detected by PyCypher:**
 * *The Fault:* The fine-tuned model replaced graph edge traversal syntax (`-[:HAS_PROBLEM]->`) with an invalid predicate expression (`AND HAS_PROBLEM {problem: 'overheating'}`).
-* *The Cause:* A 1B-parameter model requires multiple training passes (3–5 epochs) to cement strict domain grammar. Training for only 1 epoch resulted in partial syntax retention where the model recognized vocabulary tokens but lost the structural graph grammar.
----
+* *The Metric Reality:* While the Token F1 score roughly doubled, the AST parser correctly flagged this as an unexecutable query. A 1B-parameter model requires multiple training passes (3–5 epochs) to cement strict domain grammar.
+
 
 ## 💡 Recommendations for Full-Scale Runs
 
 If reproducing this pipeline on higher-tier compute (e.g., NVIDIA A100, L4, or RTX 4090):
-
-1. **Disable Sequence Packing:** Set `packing=False` (or enable `flash_attention_2` on Ampere/Ada architectures) to eliminate cross-sequence hallucination.
-2. **Increase Epochs:** Train for **3 to 5 epochs** to allow the model to fully converge on Cypher query syntax.
-3. **Use the Full Dataset:** Remove the `.select(range(...))` constraints and train across the entire ~40k training set.
-4. **Completion-Only Masking:** Use `DataCollatorForCompletionOnlyLM` to compute loss exclusively on the Cypher response rather than penalizing the model on schema tokens.
-
-
+1. **Increase Epochs:** Train for **3 to 5 epochs** to allow the model to fully converge on Cypher query syntax.
+2. **Use the Full Dataset:** Remove the subset constraints and train across the entire ~40k training set.
+3. **Completion-Only Masking:** Use `DataCollatorForCompletionOnlyLM` to compute loss exclusively on the Cypher response rather than penalizing the model on schema tokens.
+4. **Select Best Checkpoint by AST:** Configure the `SFTTrainer` to select the best model checkpoint based on the `Syntax Valid` metric rather than raw validation loss.
